@@ -10,6 +10,14 @@ buildscript {
         maven {
             url 'https://artifact.bytedance.com/repository/byteX/'
         }
+        maven {
+            url 'https://artifact.bytedance.com/repository/AwemeOpenSDK/'
+            name 'AwemeOpenSDK'
+            credentials {
+                username 'aweme-open-sdk-team'
+                password 'kT092GfY159u6Yyx'
+            }
+        }
         mavenCentral()
         google()
     }
@@ -19,6 +27,17 @@ allprojects {
     repositories {
         maven {
             url 'https://artifact.bytedance.com/repository/Volcengine/'
+        }
+        maven {
+            url 'https://artifact.bytedance.com/repository/byteX/'
+        }
+        maven {
+            url 'https://artifact.bytedance.com/repository/AwemeOpenSDK/'
+            name 'AwemeOpenSDK'
+            credentials {
+                username 'aweme-open-sdk-team'
+                password 'kT092GfY159u6Yyx'
+            }
         }
         mavenCentral()
         google()
