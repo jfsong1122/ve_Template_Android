@@ -5,6 +5,9 @@ pluginsx {
 buildscript {
     repositories {
         maven {
+            url 'http://maven.aliyun.com/nexus/content/groups/public/'
+        }
+        maven {
             url 'https://artifact.bytedance.com/repository/Volcengine/'
         }
         maven {
@@ -25,6 +28,9 @@ buildscript {
 
 allprojects {
     repositories {
+        maven {
+            url 'http://maven.aliyun.com/nexus/content/groups/public/'
+        }
         maven {
             url 'https://artifact.bytedance.com/repository/Volcengine/'
         }
