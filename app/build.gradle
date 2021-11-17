@@ -59,6 +59,7 @@ dependencies {
     implementation BaselineDeps.appcompat
 
     implementation platform ("com.volcengine.mars:platform:0.0.1-rc.47")
+    implementation 'com.component.demo:lib-android:0.0.17.full'
 
     implementation 'com.volcengine.mars:dev-tool'
     implementation 'com.volcengine.mars:base-component'
@@ -95,3 +96,4 @@ dependencies {
     //引入apm内容
     debugImplementation project(":demos:apm")
 }
+apply from: "https://lf3-fwk-res.vemarsstatic.com/obj/mars-plugin/bytebus.gradle"
