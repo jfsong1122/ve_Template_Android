@@ -1,0 +1,1550 @@
+import com.google.gson.Gson
+import com.google.gson.GsonBuilder
+import groovy.json.JsonSlurper
+import groovyx.net.http.ContentType
+import groovyx.net.http.HTTPBuilder
+import org.json.simple.JSONArray
+import org.json.simple.JSONObject
+import org.objectweb.asm.ClassReader
+import org.objectweb.asm.ClassVisitor
+import org.objectweb.asm.Opcodes
+
+import javax.net.ssl.X509TrustManager
+import javax.net.ssl.SSLContext
+import java.security.cert.X509Certificate
+import javax.net.ssl.TrustManager
+import java.security.SecureRandom
+import org.apache.http.conn.ssl.SSLSocketFactory
+import org.apache.http.conn.scheme.Scheme
+import org.apache.http.conn.scheme.SchemeRegistry
+import java.util.regex.Matcher
+import java.util.regex.Pattern
+import java.util.zip.ZipFile
+
+import static groovyx.net.http.Method.POST
+
+/**
+ * bytebus 研发平台关联gradle脚本
+ *
+ * 1. 依赖列表收集上传；
+ *
+ * 功能过多后，可以将每个功能剥离到单独的gradle文件中进行远程依赖，便于代码维护
+ *
+ */
+
+/**
+ *
+ * bytebus DSL Extension 扩展部分通过onekit-config.json配置文件实现
+ *
+ * onekit-config.json文件新增部分：
+ *
+ * "bytebus_config": {
+ *     "version_tag": "UPDATE_VERSION_CODE",
+ *     "plugin_pkg": "com.volcengine.mars"
+ * }
+ *
+ * version_tag : apk 版本号TAG：
+ *     不填：使用apk原生versionCode值
+ *     填写字段：去AndroidManifest.xml meta-data中查找UPDATE_VERSION_CODE对应value值，veMARS产品中绝大部分使用UPDATE_VERSION_CODE定义版本号。
+ */
+
+
+buildscript {
+    repositories {
+        mavenCentral()
+        google()
+    }
+
+    dependencies {
+        classpath 'org.codehaus.groovy.modules.http-builder:http-builder:0.7'
+        classpath 'org.apache.httpcomponents:httpclient:4.3.5'
+        classpath 'org.apache.httpcomponents:httpmime:4.3.5'
+        classpath 'com.googlecode.json-simple:json-simple:1.1.1'
+        classpath 'org.ow2.asm:asm:6.0'
+        classpath 'com.google.code.gson:gson:2.8.6'
+    }
+}
+
+apply from: "https://mars-devops.tos-cn-beijing.volces.com/component-statistic/depend.gradle"
+
+boolean hasGrayPublish() {
+    String workflowTypes = System.getenv("WORKFLOW_TASK_TYPES")
+    if (null != workflowTypes && workflowTypes.contains("gray_publish")) {
+        println("[bytebus]: has gray publish service in this workflow")
+        println("[bytebus-signal]:v1.0.0")
+        return true
+    }
+    println("[bytebus]: gray publish service NOT FOUND")
+    println("[bytebus-signal]:v1.0.1")
+    return false
+}
+
+// versionTag apk 版本号TAG：不填：使用apk原生versionCode值，
+class ByteBusExtension {
+    //
+    def aid
+    // apk 版本号关联TAG，
+    def versionTag
+    def flavors
+    def pluginPkg
+
+    ByteBusExtension(Project project) {
+        flavors = project.container(FlavorsExtension)
+    }
+
+    void flavors(Action<NamedDomainObjectContainer<FlavorsExtension>> action) {
+        action.execute(flavors)
+    }
+}
+
+class FlavorsExtension {
+    def name
+    def aid
+    def versionTag
+    def pluginPkg
+
+    FlavorsExtension(def name) {
+        this.name = name
+    }
+}
+
+project.extensions.create('bytebus', ByteBusExtension, project)
+project.ext.bytebusSoSet = new HashSet<String>()
+
+afterEvaluate {
+    android.applicationVariants.all { variant ->
+        if (!variant.buildType.debuggable) {
+            // release包才进行上传依赖处理
+            println "[bytebus2]:~~~~~~~injectDependencyOperations(project: $project.name, variant: $variant.name) "
+            injectDependencyOperations(project, variant)
+        }
+        if (variant.buildType.debuggable && !isUploadDependencyEnable()) {
+            Task pkgTask = project.tasks.findByName("package${variant.name.capitalize()}")
+            if (pkgTask != null) {
+                pkgTask.doLast {
+                    busUploadAppCloc()
+                }
+            }
+        }
+    }
+}
+
+// 判断上传依赖开关是否打开
+boolean isUploadDependencyEnable() {
+    boolean isUpload = false
+
+    if (project.hasProperty('bytebus.uploadDependency')) {
+        isUpload |= project['bytebus.uploadDependency'] == 'true'
+    }
+    println("[bytebus]: isUploadDependencyEnable: "+isUpload && hasGrayPublish())
+    return isUpload && hasGrayPublish()
+}
+
+// 判断上传依赖开关是否打开
+boolean isReportDependencyEnable() {
+    boolean isUpload = false
+
+    if (project.hasProperty('bytebus.reportDependency')) {
+        isUpload |= project['bytebus.reportDependency'] == 'true'
+    }
+
+    return isUpload || ext.isReportDependency
+}
+
+boolean isUploadClassInfoEnabled() {
+    boolean isUpload = false
+    if (project.hasProperty('bytebus.uploadClassInfo')) {
+        isUpload |= project['bytebus.uploadClassInfo'] == 'true'
+    }
+    return isUpload || ext.isUploadClassInfo
+}
+
+// 挂载上传依赖列表
+void injectDependencyOperations(def project, def variant) {
+    Task packageBundleTask = project.tasks.findByName("bundle${variant.name.capitalize()}")
+    Task packageTask = project.tasks.findByName("package${variant.name.capitalize()}")
+
+    def bytebusExInfo = null
+
+    if (packageBundleTask != null) {
+        println "[bytebus2]: packageBundleTask 非空，名为: $packageBundleTask.name"
+        packageBundleTask.doLast {
+            try {
+                // 获取bytebus扩展配置
+                bytebusExInfo = getByteBusExtensionInfo(project, variant)
+                println "[bytebus2]获取bytebus拓展配置完成: $bytebusExInfo"
+            } catch (Exception e) {
+                throw new RuntimeException('bytebus.gradle 错误：请先查看下面相关日志，如无法处理请联系 zhangxiao.ht.\n' + e.getMessage(), e)
+            }
+            println "[bytebus2]: 进入BundleTask 任务, project: $project.name, variant: $variant.name"
+            dealDependenciesAction(project, variant, bytebusExInfo, true)
+        }
+    }
+    if (packageTask != null) {
+        println "[bytebus2]: packageTask 非空，名为: $packageTask.name"
+        packageTask.doLast {
+            try {
+                // 获取bytebus扩展配置
+                bytebusExInfo = getByteBusExtensionInfo(project, variant)
+                println "[bytebus2]获取bytebus拓展配置完成: $bytebusExInfo"
+            } catch (Exception e) {
+                throw new RuntimeException('bytebus.gradle 错误：请先查看下面相关日志，如无法处理请联系 zhangxiao.ht.\n' + e.getMessage(), e)
+            }
+            println "[bytebus2]: 进入packageTask 任务, project: $project.name, variant: $variant.name"
+            dealDependenciesAction(project, variant, bytebusExInfo, false)
+        }
+    }
+
+    if (isUploadDependencyEnable()) {
+        println "[bytebus] upload dependency enable: true"
+        // find so
+        def compileNdk = project.tasks.findByName("compile${variant.name.capitalize()}Ndk")
+        if (compileNdk != null) {
+            compileNdk.doLast {
+                FileTree fileTree = project.fileTree(compileNdk.getObjFolder())
+                fileTree.include "**${File.separatorChar}*.so"
+
+                fileTree.files.each { item ->
+                    project.ext.bytebusSoSet.add(item.name)
+                }
+            }
+
+        }
+
+        def nativeBuildTask = project.tasks.findByName("externalNativeBuild${variant.name.capitalize()}")
+        if (nativeBuildTask != null) {
+            nativeBuildTask.doLast {
+                FileTree fileTree = project.fileTree(nativeBuildTask.getObjFolder())
+                fileTree.include "**${File.separatorChar}*.so"
+                fileTree.files.each { item ->
+                    project.ext.bytebusSoSet.add(item.name)
+                }
+            }
+        }
+    }
+}
+
+void dealDependenciesAction(def project, def variant, def bytebusExInfo, boolean isBundle) {
+    try {
+        if (isUploadDependencyEnable()) {
+            println "[bytebus] upload dependency enable: true"
+            long startTime = System.currentTimeMillis()
+            uploadDependency(project, variant, bytebusExInfo, isBundle)
+            println "[bytebus] upload dependency cost: ${(System.currentTimeMillis() - startTime) / 1000}s"
+        }
+
+        // 导出依赖文件
+        if (isExportDependencyEnabled()) {
+            println "[bytebus] export dependency enable: true"
+            exportDependency(project, variant)
+        }
+
+    } catch (Exception e) {
+        throw new RuntimeException('bytebus.gradle 错误：请先查看下面相关日志，如无法处理请联系 zhangxiao.ht.\n' + e.getMessage(), e)
+    }
+}
+
+def getApkInfo(def project, def variant, def bytebusExInfo, boolean isBundle) {
+    def apkInfo
+    if (isBundle) {
+        Task packageTask = project.tasks.getByName("package${variant.name.capitalize()}Bundle")
+        File bundleFile = null
+        try {
+            bundleFile = new File(packageTask.bundleLocation.absolutePath + File.separator + packageTask.fileName)
+        } catch (Exception e) {
+            // adapt agp 3.6.4
+            println '[bytebus] get bundleLocation failed, try bundleFile'
+            bundleFile = new File(packageTask.bundleFile.get().asFile.parentFile.absolutePath + File.separator + packageTask.fileName)
+        }
+
+        def gradleVer = getAndroidPluginVersion(variant)
+        String aabResGuardName
+        if (gradleVer >= "4.1.0") {
+            aabResGuardName = "aabresguard${variant.variantData.componentIdentity.variantName.capitalize()}"
+        } else {
+            aabResGuardName = "aabresguard${variant.variantData.name.capitalize()}"
+        }
+        if (project.tasks.findByName(aabResGuardName) != null) {
+            def aabResGuardTask = project.tasks.getByName(aabResGuardName)
+            bundleFile = aabResGuardTask.getObfuscatedBundlePath().toFile()
+        } else {
+            println "[bytebus]aabresguard${variant.name.capitalize()} is not found"
+        }
+        if (bundleFile == null) {
+            println "[bytebus] bundleFile is null"
+            return
+        }
+        println "[bytebus] bundleFile: ${bundleFile.absolutePath}"
+        def version = String.valueOf(variant.versionCode)
+        def applicationId = ''
+        try {
+            applicationId = variant.variantData.scope.variantConfiguration.applicationId
+        } catch (Exception e) {
+            println "get applicationId by variantConfiguration failed, try defaultConfig"
+            applicationId = project.getExtensions().getByName('android').getDefaultConfig().getApplicationId()
+        }
+        // 海外版short_version与build_version一致
+        apkInfo = ["packageName": applicationId, "version": version, "packageSize": bundleFile.length(),
+                   "app_short_version":version, "app_build_version":version, "app_version_name":version]
+    } else {
+        // aapt文件
+        File aaptFile = getAaptFileNew(variant)
+        println "[bytebus] aaptFile: ${aaptFile.absolutePath}"
+
+        File apkFile = null
+        try {
+            def variantScope = variant.variantData.scope
+            apkFile = new File(variantScope.apkLocation, "${variantScope.globalScope.archivesBaseName}-${variantScope.variantConfiguration.baseName}.apk")
+            println "[bytebus2]: ~~~~ bad things may happen here, variantScope: $variantScope; variantScope.apkLocation: $variantScope.apkLocation; variantScope.globalScope.archivesBaseName: $variantScope.globalScope.archivesBaseName; variantScope.variantConfiguration.baseName: $variantScope.variantConfiguration.baseName"
+        } catch (Throwable ignore) {
+            // apkLocatoin在低版本plugin上不存在。保护一下。
+            BasePluginConvention convention = project.getConvention().findPlugin(BasePluginConvention.class)
+            apkFile = new File(variant.variantData.paths.apkLocation, "${convention.getArchivesBaseName()}-${variant.variantData.variantDslInfo.baseName}.apk")
+        }
+        if (apkFile == null || !apkFile.exists()) {
+            apkFile = variant.outputs[0].outputFile
+        }
+        println "[bytebus] apkFile: ${apkFile.absolutePath}"
+        apkInfo = getApkInfo(aaptFile, apkFile, bytebusExInfo.versionTag)
+    }
+    return apkInfo
+}
+
+void uploadDependency(def project, def variant, def bytebusExInfo, boolean isBundle) {
+    String commitId = getCurrCommitId(project)
+    def apkInfo = getApkInfo(project, variant, bytebusExInfo, isBundle)
+
+    def isPlugin = false
+    def pkgName = null
+    def verCode = null
+    JSONObject requestBody = new JSONObject()
+
+    def dependencyJsonArrayStr = busGetDependency(variant.getFlavorName())
+
+    requestBody.put('app_id', bytebusExInfo.aid)
+    requestBody.put('app_platform', 2)
+    requestBody.put('app_short_version', apkInfo.app_version_name)
+    requestBody.put('app_build_version', apkInfo.app_build_version)
+    requestBody.put('app_commit_sha', commitId)
+    requestBody.put("app_git_repo", getGitRepositoryUrl(project))
+    requestBody.put('env', getBuildEnv(project))
+
+    requestBody.put('packageSize', String.valueOf(apkInfo.packageSize))
+    requestBody.put('name', apkInfo.appName)
+    requestBody.put('versionType', 0)
+    verCode = apkInfo.version
+    if (bytebusExInfo.pluginPkg != null && !bytebusExInfo.pluginPkg.isEmpty()) {
+        pkgName = bytebusExInfo.pluginPkg
+        requestBody.put('isPlugin', true)
+        isPlugin = true
+    } else {
+        pkgName = apkInfo.packageName
+        requestBody.put('isPlugin', false)
+        isPlugin = false
+    }
+
+    println "[bytebus] apk info: ${requestBody}"
+    // 调整依赖数据格式
+    def list = new JsonSlurper().parseText(dependencyJsonArrayStr)
+    JSONArray dependencyArrayV2 = new JSONArray()
+    list.each {
+        JSONObject obj = new JSONObject()
+        obj.put("name", it.name)
+        obj.put("tech_type", it.tech_type)
+        obj.put("version_type", it.version_type)
+        obj.put("version", it.version)
+        dependencyArrayV2.add(obj)
+    }
+    requestBody.put('components', dependencyArrayV2)
+
+//    requestBody.put('components', dependencyArrayV2)
+    def variantDir = new File(project.buildDir, "/bytebus/$variant.name")
+    deleteFolder(variantDir)
+    if (!variantDir.mkdirs()){
+        throw new GradleException("Failed to create folder: " + variantDir);
+    }
+    def outputFile = new File(variantDir, "requestBody.json")
+    if (outputFile.exists()) {
+        outputFile.delete()
+    }
+    outputFile.createNewFile()
+    OutputStreamWriter osw = new OutputStreamWriter(outputFile.newOutputStream(),"UTF-8");
+    osw.write(requestBody.toString())
+    osw.flush();//清空缓冲区，强制输出数据
+    osw.close();//关闭输出流
+
+    // 上传依赖信息到服务端
+    if (!isPlugin) {
+        uploadDepsInfoToVeMARS(requestBody)
+    }
+
+    if (isPlugin && pkgName != null && !pkgName.isEmpty() && verCode != null && !verCode.isEmpty()) {
+        File mappingFile = null
+        try {
+            mappingFile = variant.mappingFile
+        } catch (Throwable ignore) {
+            // ignore
+        }
+        if (mappingFile != null && mappingFile.exists()) {
+            println "[bytebus] start upload mapping."
+            busUploadMappingRequest("http://symbolicate.byted.org/android_upload",
+                    mappingFile.getPath(), "Plugin", pkgName, verCode)
+            println "[bytebus] end upload mapping."
+        }
+    }
+}
+
+
+void reportDependency(def project, def variant, def bytebusExInfo, boolean isBundle) {
+    if (bytebusExInfo.pluginPkg != null && !bytebusExInfo.pluginPkg.isEmpty()) {
+        // 插件打包直接返回
+        return
+    }
+
+    def apkInfo = getApkInfo(project, variant, bytebusExInfo, isBundle)
+    def dependencyJsonArrayStr = busGetDependency(variant.getFlavorName())
+    reportDependencyWithDeps(project, bytebusExInfo, apkInfo, dependencyJsonArrayStr)
+}
+
+void reportDependencyWithDeps(def project, def bytebusExInfo, def apkInfo, def dependencyJsonArrayStr) {
+    if (bytebusExInfo.pluginPkg != null && !bytebusExInfo.pluginPkg.isEmpty()) {
+        // 插件打包直接返回
+        return
+    }
+
+    String commitId = getCurrCommitId(project)
+
+    JSONObject requestBody = new JSONObject()
+    requestBody.put("app_identifier", apkInfo.packageName)
+    requestBody.put("app_platform", 2)
+    requestBody.put("app_short_version", apkInfo.app_short_version)
+    requestBody.put("app_build_version", apkInfo.app_build_version)
+    requestBody.put("app_commit_sha", commitId)
+    requestBody.put("app_git_repo", getGitRepositoryUrl(project))
+    requestBody.put('env', getBuildEnv(project))
+
+    // 调整依赖数据格式
+    def list = new JsonSlurper().parseText(dependencyJsonArrayStr)
+    JSONArray dependencyArrayV2 = new JSONArray()
+    list.each {
+        JSONObject obj = new JSONObject()
+        obj.put("name", it.componentName)
+        obj.put("tech_type", 2)
+        obj.put("version_type", 0)
+        obj.put("version", it.componentVersion)
+        dependencyArrayV2.add(obj)
+    }
+    requestBody.put('components', dependencyArrayV2)
+
+    def dependency_lock_file = project.rootProject.file('dependency-lock.json')
+    if (dependency_lock_file.exists()) {
+        String lock_base64 = dependency_lock_file.readBytes().encodeBase64().toString()
+        requestBody.put("dependencies_lock", lock_base64)
+    }
+    // 上传依赖信息到服务端
+    println "start to report dependency"
+    def resp = project.busHttpRequestWithTimtout("https://bits.bytedance.net/openapi/v1/component/report_application_version_dependencies", 2,
+            null, requestBody.toString(), 20000, 20000)
+    println "report dependency response " + resp
+}
+
+void uploadClassInfo(def project, def variant, def bytebusExInfo, boolean isBundle, def version) {
+    String commitId = getCurrCommitId(project)
+    if (version == null) {
+        def apkInfo
+        if (isBundle) {
+            version = String.valueOf(variant.versionCode)
+        } else {
+            // aapt文件
+            File aaptFile = getAaptFileNew(variant)
+            println "[bytebus] aaptFile: ${aaptFile.absolutePath}"
+
+            File apkFile = null
+            try {
+                def variantScope = variant.variantData.scope
+                apkFile = new File(variant.variantData.scope.apkLocation, "${variantScope.globalScope.archivesBaseName}-${variantScope.variantConfiguration.baseName}.apk")
+            } catch (Throwable ignore) {
+                // apkLocatoin在低版本plugin上不存在。保护一下。
+                BasePluginConvention convention = project.getConvention().findPlugin(BasePluginConvention.class)
+                apkFile = new File(variant.variantData.paths.apkLocation, "${convention.getArchivesBaseName()}-${variant.variantData.variantDslInfo.baseName}.apk")
+            }
+            if (apkFile == null || !apkFile.exists()) {
+                apkFile = variant.outputs[0].outputFile
+            }
+            println "[bytebus] apkFile: ${apkFile.absolutePath}"
+            apkInfo = getApkInfo(aaptFile, apkFile, bytebusExInfo.versionTag)
+            version = apkInfo.version
+        }
+    }
+
+    def isPlugin = false
+    if (bytebusExInfo.pluginPkg != null && !bytebusExInfo.pluginPkg.isEmpty()) {
+        isPlugin = true
+    } else {
+        isPlugin = false
+    }
+    // gradle 3.0.0 及以上才进行以下操作
+    def gradleVer = getAndroidPluginVersion(variant)
+    println "[bytebus] gradle plugin version is ${gradleVer}"
+    println "[bytebus] gradle version is ${gradle.gradleVersion}"
+    if (gradleVer >= '3.0.0' && gradle.gradleVersion >= '3.4.0') {
+        JSONArray jsonArray = genDependencyDetailJsonArray(variant, version, isPlugin)
+        JSONObject crashDispatchJson = unfoldInfo(jsonArray)
+        uploadCrashDispatchJson(crashDispatchJson, bytebusExInfo.aid.toString(),
+                version, commitId.substring(0, 7), bytebusExInfo.pluginPkg)
+    } else {
+        println "[bytebus] gradle plugin version under 3.0.0, or gradle version under 3.4.0, need not upload crash dispatch info."
+    }
+}
+
+boolean isExportDependencyEnabled() {
+    boolean isExport = false
+    if (project.hasProperty('bytebus.exportDependency')) {
+        isExport |= project['bytebus.exportDependency'] == 'true'
+    }
+    return isExport
+}
+
+def exportDependency(def project, def variant) {
+    println "[bytebus] start export dependency, project is: $project.name, variant is: $variant.flavorName"
+    def dependencyJsonArray = busGetDependency(variant.getFlavorName())
+    if (dependencyJsonArray != null) {
+        def variantDir = new File(project.buildDir, "/bytebus/$variant.name")
+        if (!variantDir.exists()){
+            variantDir.mkdirs()
+        }
+        def outputFile = new File(variantDir.path, "dependencies.json")
+        if (outputFile.exists()) {
+            outputFile.delete()
+        }
+        outputFile.createNewFile();
+        def outputStream = outputFile.newOutputStream();
+        outputStream.write(dependencyJsonArray.bytes)
+        outputStream.close()
+    }
+}
+
+def getByteBusExtensionInfo(Project project, def variant) {
+    def flavorConfig = project.extensions.findByName(variant.name+ "ByteBusConfig")
+
+    println "--------------- ONEKIT-PLUGIN TEST HERE ----------------"
+    println "aid: $flavorConfig.aid"
+    println "version_tag: $flavorConfig.versionTag"
+    println "plugin_pkg: $flavorConfig.pluginPkg"
+
+    if (flavorConfig.versionTag == null){
+        flavorConfig.versionTag = 'android:versionCode'
+        println "[bytebus2]: WACHT ================= falvorConfig.versionTag == null, 将其替换为: android:versionCode"
+    }
+    String aid = null
+    def versionTag = null
+    def pluginPkg = null
+
+    String variantName = variant.name
+    String flavor = ''
+    if (variantName.endsWith('Release')) {
+        flavor = variantName.substring(0, variantName.length() - 7)
+    } else if (variantName.endsWith('Debug')) {
+        flavor = variantName.substring(0, variantName.length() - 5)
+    }
+
+    println "[bytebus2]: WACHT ================= flavor: $flavor"
+
+    // 下面做强行校验，防止业务方填错影响线上数据。
+    if (flavor.length() > 0) {
+        println "[bytebus2]: ================= flavor: $flavor"
+        if (!flavorConfig) {
+            throw new IllegalArgumentException("没有检索到flavor：${flavor} 对应的onekit-config.json文件，请自查")
+        }
+
+        if (flavorConfig.aid == null) {
+            throw new IllegalArgumentException("onekit-config.json配置文件中没有配置aid属性，flavor：${flavor} 。")
+        }
+        int appId
+        try {
+            appId = Integer.parseInt(flavorConfig.aid)
+        }catch(NumberFormatException e){
+            throw new IllegalArgumentException("onekit-config.json配置文件中aid属性必须是int类型，flavor：${flavor} 。")
+        }
+
+        if (flavorConfig.versionTag == null) {
+            throw new IllegalArgumentException("onekit-config.json配置文件中没有配置versionTag属性，flavor：${flavor} 。")
+        }
+
+        if (!(flavorConfig.versionTag instanceof String)) {
+            throw new IllegalArgumentException("onekit-config.json配置文件中versionTag属性必须是String类型，flavor：${flavor} 。")
+        }
+
+        if (flavorConfig.pluginPkg != null && !(flavorConfig.pluginPkg instanceof String)) {
+            throw new IllegalArgumentException("onekit-config.json配置文件中pluginPkg属性必须是String类型，flavor：${flavor} 。")
+        }
+
+        aid = appId
+        versionTag = flavorConfig.versionTag
+        pluginPkg = flavorConfig.pluginPkg
+    } else {
+        // 没有flavor情况
+        aid = flavorConfig.aid
+        versionTag = flavorConfig.versionTag
+        pluginPkg = flavorConfig.pluginPkg
+
+        if (flavorConfig.aid == null) {
+            throw new IllegalArgumentException("bytebus.gradle 扩展 bytebus{...}中没有配置aid属性。")
+        }
+
+        try {
+            Integer.parseInt(flavorConfig.aid)
+        }catch(NumberFormatException e){
+            throw new IllegalArgumentException("onekit-config.json配置文件中aid属性必须是int类型，flavor：${flavor} 。")
+        }
+
+        if (flavorConfig.versionTag == null) {
+            throw new IllegalArgumentException("bytebus.gradle 扩展 bytebus{...}中没有配置versionTag属性。")
+        }
+
+        if (!(flavorConfig.versionTag instanceof String)) {
+            throw new IllegalArgumentException("bytebus.gradle 扩展 bytebus{...}中versionTag属性必须是String类型。")
+        }
+
+        if (flavorConfig.pluginPkg != null && !(bytebus.pluginPkg instanceof String)) {
+            throw new IllegalArgumentException("bytebus.gradle 扩展 bytebus{...}中pluginPkg属性必须是String类型。")
+        }
+
+    }
+
+
+    return ['aid': aid, 'versionTag': versionTag, 'pluginPkg': pluginPkg]
+}
+
+File getAaptFileNew(def variant) {
+    try {
+        def variantScope = variant.variantData.scope
+        return getAaptFile(variantScope)
+    } catch (Throwable t) {
+        t.printStackTrace()
+        String toolsPath = variant.variantData.globalScope.sdkComponents.get().buildToolInfoProvider.get().mPath
+        if (toolsPath == null || !(new File(toolsPath, 'aapt').exists())) {
+            if (toolsPath == null) {
+                throw new IllegalStateException("未找到aapt文件：toolsPath is null")
+            } else {
+                throw new IllegalStateException("未找到aapt文件：${toolsPath}/aapt file not exist")
+            }
+
+        }
+        return new File(toolsPath, 'aapt')
+    }
+}
+
+File getAaptFile(def variantScope) {
+    String toolsPath
+    try {
+        toolsPath = variantScope.globalScope.androidBuilder.buildToolInfo.mPath
+    } catch (Throwable e) {
+        e.printStackTrace()
+        try {
+            if (variantScope.variantData.scope.globalScope.sdkComponents.sdkLoadStrategy.directLoad.components == null) {
+                println "components is null, try new strategy"
+                def buildToolsVersion = variantScope.variantData.scope.globalScope.sdkComponents.sdkLoadStrategy.directLoad.buildToolRevisionSupplier.get()
+                def sdk_dir = variantScope.variantData.scope.globalScope.sdkComponents.sdkLoadStrategy.directLoad.sdkLocationSourceSet.localProperties.get("sdk.dir")
+                toolsPath = sdk_dir + "/build-tools/" + buildToolsVersion
+            } else {
+                toolsPath = variantScope.variantData.scope.globalScope.sdkComponents.sdkLoadStrategy.directLoad.components.buildToolInfo.mPath
+            }
+        } catch (Throwable t) {
+            t.printStackTrace()
+        }
+    }
+
+    if (toolsPath == null || !(new File(toolsPath, 'aapt').exists())) {
+        if (toolsPath == null) {
+            throw new IllegalStateException("未找到aapt文件 ：toolsPath is null")
+        } else {
+            throw new IllegalStateException("未找到aapt文件 ：${toolsPath}/aapt file not exist")
+        }
+    }
+
+    return new File(toolsPath, 'aapt')
+}
+
+def getApkInfo(File aaptFile, File apk, def versionTag) {
+    long packageSize = apk.length()
+    def stdout = new ByteArrayOutputStream()
+    try {
+        project.exec {
+            commandLine aaptFile.absolutePath, 'dump', 'badging', apk.absolutePath
+            standardOutput = stdout
+        }
+    } catch (Exception e) {
+        println "[bytebus] getApkInfo Exception: " + e.toString()
+    }
+
+    String manifestStr = stdout.toString().trim()
+    stdout.close()
+
+    String packageName = null
+    String appName = null
+    String version = null
+    String app_short_version = null
+    String app_build_version = null
+    String app_version_name = null
+
+    String[] manifestArray = manifestStr.split('\n')
+    for (int i = 0; i < manifestArray.length; i++) {
+        String line = manifestArray[i].trim()
+        if (line.startsWith('package: name=')) {
+            // 包名提取
+            Pattern pattern = Pattern.compile("package: name='(.+?)' versionCode='(.+?)' versionName='(.+?)' .+")
+            Matcher matcher = pattern.matcher(manifestStr)
+            if (matcher.find()) {
+                packageName = matcher.group(1)
+
+                if (versionTag == 'android:versionCode') {
+                    version = matcher.group(2)
+                    app_short_version = version
+                } else {
+                    app_short_version = matcher.group(2)
+                }
+                app_version_name = matcher.group(3)
+            }
+            continue
+        }
+
+        if (line.startsWith('application: label=')) {
+            // 包名提取
+            Pattern pattern = Pattern.compile("application: label='(.+?)' .+")
+            Matcher matcher = pattern.matcher(manifestStr)
+            if (matcher.find()) {
+                appName = matcher.group(1)
+            }
+            break
+        }
+    }
+
+    if('android:versionCode' != versionTag) {
+        app_build_version = getUpdateVersion(aaptFile, apk, versionTag)
+        version = app_build_version
+    } else {
+        // 没小版本号的情况下，默认app_build_version与app_short_version一致
+        app_build_version = app_short_version
+    }
+
+    return ["packageName": packageName, "appName": appName, "version": version, "packageSize": packageSize, "app_short_version":app_short_version,
+            "app_build_version":app_build_version, "app_version_name":app_version_name]
+}
+
+String getUpdateVersion(File aaptFile, File apk, def versionTag) {
+    def stdout = new ByteArrayOutputStream()
+    project.exec {
+        commandLine aaptFile.absolutePath, 'd', 'xmltree', apk.absolutePath, 'AndroidManifest.xml'
+        standardOutput = stdout
+    }
+    String manifestStr = stdout.toString().trim()
+    stdout.close()
+
+    String updateVersion = null
+    String[] manifestArray = manifestStr.split('\n')
+    for (int i = 0; i < manifestArray.length; i++) {
+        String line = manifestArray[i].trim()
+        if (line.contains(versionTag)) {
+            // updateVersion有可能其它字段，再进行扩展
+            String lastLine = manifestArray[i - 1].trim()
+            if (lastLine.startsWith('E: meta-data ')) {
+                String nextLine = manifestArray[i + 1].trim()
+                String hexVersion = nextLine.substring(nextLine.lastIndexOf(')') + 3)
+                updateVersion = String.valueOf(Integer.parseInt(hexVersion, 16))
+            }
+        }
+    }
+
+    if (updateVersion == null) {
+        throw new IllegalArgumentException("AndroidManifest.xml中没有找到对应meta-data=\"${versionTag}\"定义版本号的地方。")
+    }
+
+    return updateVersion
+}
+
+
+/**
+ *
+ * 获取project工程当前commitId
+ * @param project
+ * @return 成功：40位标准格式CommitID，失败：null
+ *
+ */
+String getCurrCommitId(Project project) {
+    def stdout = new ByteArrayOutputStream()
+    project.exec {
+        commandLine 'git', 'rev-parse', 'HEAD'
+        standardOutput = stdout
+    }
+
+    String commitId = stdout.toString().trim()
+    stdout.close()
+
+    if (Pattern.matches('[0-9a-fA-F]{40}', commitId)) {
+        return commitId
+    }
+
+    return null
+}
+
+String getBuildEnv(Project project) {
+    def stdout = new ByteArrayOutputStream()
+    project.exec {
+        commandLine 'env'
+        standardOutput = stdout
+    }
+
+    String envStr = stdout.toString().trim()
+    stdout.close()
+    return envStr
+}
+
+def uploadDepsInfoToVeMARS(JSONObject jsonBody) {
+    String reportHost = "https://devops-api-online-tob.vemarsdev.com"
+    String reportPath = "/component/v1/app/report_pod_dependency"
+    String marsCacheHost = System.getenv("MARS_CACHE_HOST")
+    if (null != marsCacheHost && !marsCacheHost.equals("")) {
+        reportHost = marsCacheHost
+        println "[bytebus] get host from env: $marsCacheHost"
+    }
+    String url = reportHost + reportPath
+    println "[bytebus] report url: $url"
+    def http = new HTTPBuilder(url)
+    def sslContext = SSLContext.getInstance("SSL")
+    sslContext.init(null, [ new X509TrustManager() {
+        public X509Certificate[] getAcceptedIssuers() {null }
+        public void checkClientTrusted(X509Certificate[] certs, String authType) { }
+        public void checkServerTrusted(X509Certificate[] certs, String authType) { }
+    } ] as TrustManager[], new SecureRandom())
+    def sf = new SSLSocketFactory(sslContext)
+    def httpsScheme = new Scheme("https", sf, 8443)
+    http.client.connectionManager.schemeRegistry.register( httpsScheme )
+    println "[bytebus] start uploadDepsInfo----------------------->>>>>>>>"
+
+    http.request(POST, ContentType.JSON) { req ->
+        body = jsonBody
+
+        println jsonBody
+
+        response.success = { resp, json ->
+            if (resp.status == 200) {
+                println "[bytebus] responese sataus: " + resp.status
+                println "[bytebus] responese issuccess: " + resp.isSuccess()
+                if (json['code'] == 0) {
+                    println "[bytebus] ${json}"
+                    println "[bytebus] success to upload dependency. resp: $resp"
+                } else {
+                    println "[bytebus] failed to upload, responese: " + resp
+                }
+            } else {
+                println "[bytebus] failed to upload dependency, status: ${resp.status}"
+            }
+        }
+
+        response.failure = { resp ->
+            println "[bytebus] failed to upload dependency: ${resp.status}"
+        }
+    }
+}
+
+/**
+ *
+ * 获取project工程当前git repository url
+ * @param project
+ * @return 成功：url，失败：null
+ *
+ */
+String getGitRepositoryUrl(Project project) {
+    def stdout = new ByteArrayOutputStream()
+    project.exec {
+        commandLine 'git', 'config', '--get', 'remote.origin.url'
+        standardOutput = stdout
+    }
+
+    String gitUrl = stdout.toString().trim()
+    stdout.close()
+
+    if (gitUrl.startsWith("git@") || gitUrl.startsWith("https")) {
+        return gitUrl
+    }
+
+    return null
+}
+
+JSONObject unfoldInfo(JSONArray jsonArray) {
+    JSONObject result = new JSONObject()
+    JSONObject resultClass = new JSONObject()
+    JSONObject resultSo = new JSONObject()
+    jsonArray.each { object ->
+        String gitUrl = object.get("git_url", null)
+        String commitId = object.get("commit_id", null)
+        String sdkName = object.get("sdk_name", null)
+        String sdkVer = object.get("sdk_version", null)
+        String sdkVerTimeStamp = object.get("sdk_version_timestamp", null)
+        String author = object.get("author", null)
+        String email = object.get("email", null)
+        JSONObject classesObject = object.get("classes", null)
+        String soList = object.get("so", null)
+        if (soList != null && !soList.isEmpty()) {
+            String[] soStrs = soList.split("#")
+            soStrs.each { soName ->
+                if (soName != null && !soName.isEmpty()) {
+                    JSONObject soObj = new JSONObject()
+                    soObj.put("sdk_name", sdkName)
+                    soObj.put("sdk_version", sdkVer)
+                    if (author != null && !author.isEmpty()) {
+                        soObj.put("author", author)
+                    }
+                    if (email != null && !email.isEmpty()) {
+                        soObj.put("email", email)
+                    }
+                    resultSo.put(soName, soObj)
+                }
+            }
+        }
+        if (classesObject != null && !classesObject.isEmpty()) {
+            classesObject.each { className ->
+                JSONObject obj = new JSONObject()
+                obj.put("path", className.value)
+                obj.put("git", gitUrl)
+                obj.put("checkoutInfo", commitId)
+                obj.put("sdk_name", sdkName)
+                obj.put("sdk_version", sdkVer)
+                if (sdkVerTimeStamp != null) {
+                    obj.put("sdk_version_timestamp", sdkVerTimeStamp)
+                }
+                if (author != null && !author.isEmpty()) {
+                    obj.put("author", author)
+                }
+                if (email != null && !email.isEmpty()) {
+                    obj.put("email", email)
+                }
+                resultClass.put(className.key, obj)
+            }
+        }
+    }
+    result.put("classes", resultClass)
+    result.put("so", resultSo)
+    return result
+}
+
+JSONArray genDependencyDetailJsonArray(def variant, String mainVersion, boolean isPlugin) {
+    JSONArray jsonArray = new JSONArray()
+
+    Map<ResolvedArtifactResult, String> map = getDependenciesMap(variant)
+    for (Map.Entry it : map) {
+        ResolvedArtifactResult artifact = it.key
+        String dependency = it.value
+        // dependency.endsWith(".jar") && isPlugin: 适配部分插件如 ttplayer 直接以 lib 目录下的 jar 作为源码， 用于支持第三类监控的插件监控功能
+        if (artifact.id.componentIdentifier.class.simpleName.equals("DefaultModuleComponentIdentifier")
+                || artifact.id.componentIdentifier.class.simpleName.equals("MavenUniqueSnapshotComponentIdentifier")
+                || (dependency.endsWith(".jar") && isPlugin)) {
+            String[] splits = dependency.split(':')
+            JSONObject json = new JSONObject()
+            boolean needPrase = false
+            if (splits != null && splits.length >= 3) {
+                json.put('sdk_name', splits[0] + ":" + splits[1])
+                json.put('sdk_version', splits[2])
+                if (splits[2].contains("-SNAPSHOT") && splits.length == 4) {
+                    json.put('sdk_version_timestamp', splits[3])
+                }
+                needPrase = true
+            } else if (dependency.endsWith(".jar") && isPlugin) {
+                json.put('sdk_name', "lib:" + dependency.substring(0, dependency.length() - 4))
+                json.put('sdk_version', 'unknown')
+                needPrase = true
+            }
+            if (needPrase) {
+                String jarFilePath = artifact.file.toString()
+                ZipFile zipFile = new ZipFile(jarFilePath)
+                String zipComment = zipFile.comment
+                boolean needSearchSo = true
+                if (zipComment != null && !zipComment.isEmpty()) {
+                    String info = findTagValue(zipComment, "byteBus")
+                    if (info != null && !info.isEmpty()) {
+                        needSearchSo = false
+                        String gitUrl = findTagValue(info, "gitUrl")
+                        String commitId = findTagValue(info, "commitId")
+                        String soList = findTagValue(info, "soList")
+                        String author = findTagValue(info, "author")
+                        String email = findTagValue(info, "email")
+                        if (gitUrl != null && !gitUrl.isEmpty()) {
+                            json.put("git_url", gitUrl)
+                        }
+                        if (commitId != null && !commitId.isEmpty()) {
+                            json.put("commit_id", commitId)
+                        }
+                        if (soList != null && !soList.isEmpty()) {
+                            json.put("so", soList)
+                        }
+                        if (author != null && !author.isEmpty()) {
+                            json.put("author", author)
+                        }
+                        if (email != null && !email.isEmpty()) {
+                            json.put("email", email)
+                        }
+                    }
+                }
+
+                // 临时开启该开关，用于强制检测，aar 里的 so, 因为当前 publish 脚本仅仅收集了在发布时编译的so, 未收集直接放在 libs 目录下的 so
+                needSearchSo = true
+                // 重新解析 aar 的 so 文件
+                if (needSearchSo && artifact.file.path.contains(".aar${File.separator}")) {
+                    Set soSet = new HashSet()
+                    searchAarSo(artifact.file.getParentFile().getParent(), soSet)
+                    if (soSet.size() > 0) {
+                        String soList = ""
+                        soSet.each { soName ->
+                            soList = "$soList#$soName"
+                        }
+                        json.put("so", soList)
+                    }
+                }
+
+                JSONObject classObjList = new JSONObject()
+                ZipFile jarFile = new ZipFile(jarFilePath)
+                jarFile.entries().each { classEntry ->
+                    String className = classEntry.name
+                    if (className.endsWith(".class") && !className.contains("\$")
+                            && !className.equals("BuildConfig.class")
+                            && !className.endsWith("${File.separator}BuildConfig.class")
+                            && !className.equals("R.class")
+                            && !className.endsWith("${File.separator}R.class")
+                            && !className.startsWith("kotlin${File.separator}")
+                            && !className.startsWith("org${File.separator}khronos${File.separator}webgl${File.separator}")
+                            && !className.startsWith("org${File.separator}w3c${File.separator}")) {
+                        String adjustName = className.replaceAll(File.separator, ".")
+                        adjustName = adjustName.substring(0, adjustName.length() - 6)
+                        String path = ""
+                        String entryComment = findTagValue(classEntry.getComment(), "bb")
+                        if (entryComment != null) {
+                            String[] strs = entryComment.split("#")
+                            if (strs != null && strs.length > 0) {
+                                path = strs[0] + className.substring(0, className.length() - 6)
+                                if (strs.length == 2) {
+                                    if (strs[1].equals("kt") && path.endsWith("Kt")) {
+                                        path = path.substring(0, path.length() - 2) + "." + strs[1]
+                                    } else {
+                                        path += "." + strs[1]
+                                    }
+                                }
+                            }
+                        }
+                        classObjList.put(adjustName, path)
+                    }
+                }
+                json.put("classes", classObjList)
+                jsonArray.add(json)
+            } else {
+                println "[bytebus] warning:invalid dependency: ${dependency}"
+            }
+        } else if (artifact.id.componentIdentifier.class.simpleName.equals("DefaultProjectComponentIdentifier")) {
+            // project :tt:common
+            if (dependency.startsWith("project ")) {
+                dependency = dependency.substring(8, dependency.length())
+            }
+            JSONObject json = new JSONObject()
+            json.put('sdk_name', "main" + dependency)
+            json.put('sdk_version', mainVersion)
+            json.put('git_url', getGitRepositoryUrl(project))
+            json.put('commit_id', getCurrCommitId(project))
+
+            // fix bug: project(':module-basebiz').projectDir = new File(settingsDir, 'BaseBiz/module-basebiz')
+            String modulePath = project.rootDir.absolutePath + File.separator + dependency.replace(":", File.separator)
+            File file = new File(modulePath)
+            if (!file.exists()) {
+                String adJustModulePath = artifact.file.toPath()
+                if (adJustModulePath.contains("${File.separator}build${File.separator}")) {
+                    adJustModulePath = adJustModulePath.split("${File.separator}build${File.separator}")[0]
+                    file = new File(adJustModulePath)
+                    if (file.exists()) {
+                        modulePath = adJustModulePath
+                    }
+                }
+            }
+
+            JSONObject componentClassJson = getProjectComponentClass(modulePath, artifact)
+            if (componentClassJson.containsKey("so")) {
+                json.put("so", componentClassJson.get("so"))
+                componentClassJson.remove("so")
+            }
+            json.put('classes', componentClassJson)
+            jsonArray.add(json)
+        } else {
+            println "[bytebus] warning:invalid dependency: ${dependency}"
+        }
+    }
+
+    JSONObject json = new JSONObject()
+    json.put('sdk_name', "main")
+    json.put('sdk_version', mainVersion)
+    json.put('git_url', getGitRepositoryUrl(project))
+    json.put('commit_id', getCurrCommitId(project))
+    JSONObject mainProjectClassJson = getMainProjectClass(variant)
+    if (mainProjectClassJson.containsKey("so")) {
+        json.put("so", mainProjectClassJson.get("so"))
+        mainProjectClassJson.remove("so")
+    }
+    json.put('classes', mainProjectClassJson)
+
+    if (project.ext.bytebusSoSet != null
+            && project.ext.bytebusSoSet.size() > 0) {
+        def isFirst = true
+        def soList = null
+        project.ext.bytebusSoSet.each { soName ->
+            if (isFirst) {
+                soList = soName
+                isFirst = false
+            } else {
+                soList = "${soList}#${soName}"
+            }
+        }
+        if (soList != null) {
+            // 表示 lib 下存在第三方的 so 依赖
+            if (json.containsKey('so')) {
+                soList = "${soList}#${json.get('so')}"
+            }
+            json.put('so', soList)
+        }
+    }
+    jsonArray.add(json)
+    return jsonArray
+}
+
+String findTagValue(String str, String Tag) {
+    if (str == null || str.isEmpty()) {
+        return null
+    }
+    Pattern pattern = Pattern.compile("<${Tag}>(.+?)</${Tag}>")
+    Matcher matcher = pattern.matcher(str)
+    String info = null
+    if (matcher.find()) {
+        info = matcher.group(1)
+    }
+    return info
+}
+
+JSONObject getMainProjectClass(def variant) {
+    List<File> filterList = getFilterFile(variant)
+    JSONObject jsonObj = new JSONObject()
+    project.android.sourceSets.each { sourceSet ->
+        List<File> list = new LinkedList<>()
+        try {
+            list.addAll(sourceSet.java.getSrcDirs())
+        } catch (Exception e) {
+            // ignore
+        }
+        try {
+            list.addAll(sourceSet.kotlin.getSrcDirs())
+        } catch (Exception e) {
+            // ignore
+        }
+        try {
+            list.addAll(sourceSet.jniLibs.getSrcDirs())
+        } catch (Exception e) {
+            // ignore
+        }
+
+        for (File file : list) {
+            if (file.exists()) {
+                file.listFiles().each { it ->
+                    recursiveFile(it, jsonObj, "", filterList)
+                }
+            }
+        }
+    }
+
+    // 根据kotlin类编译后的class处理在一个kotlin类文件中声明多个类的情况
+    Task compileKotlin = tasks.findByName("compile${variant.name.capitalize()}Kotlin")
+    if (compileKotlin != null) {
+        File dest = compileKotlin.destinationDir
+        if (dest.exists()) {
+            recursiveFile(dest, jsonObj, "", null)
+        }
+    }
+    return jsonObj
+}
+
+/**
+ * 获取变体所对应的代码目录
+ * @param variant
+ * @return
+ */
+List<File> getFilterFile(def variant) {
+    List<File> list = new ArrayList<>()
+    variant.sourceSets.each { sourceSet ->
+        try {
+            list.addAll(sourceSet.java.getSrcDirs())
+        } catch (Exception e) {
+            // ignore
+        }
+        try {
+            list.addAll(sourceSet.kotlin.getSrcDirs())
+        } catch (Exception e) {
+            // ignore
+        }
+        try {
+            list.addAll(sourceSet.jniLibs.getSrcDirs())
+        } catch (Exception e) {
+            // ignore
+        }
+    }
+    return list
+}
+
+/**
+ * 根据artifact获取该module的代码目录
+ * @param modulePath
+ * @param artifact
+ * @return
+ */
+List<File> getFilterFileForModule(String modulePath, def artifact) {
+    List<File> list = new ArrayList<>()
+    modulePath = modulePath.replaceAll("//", "/")
+    def targetProject = rootProject.allprojects.find {
+        it.projectDir.absolutePath == modulePath
+    }
+
+    if (targetProject != null) {
+        try {
+            AttributeContainer attributeContainer = artifact.variant.attributes
+
+            def key_flavor = attributeContainer.keySet().find {
+                it.name == "app"
+            }
+            String flavorName = null
+            if (key_flavor != null) {
+                flavorName = attributeContainer.getAttribute(key_flavor).getName()
+            }
+            // 只对多flavor的情况存在
+            if (flavorName != null && !flavorName.isEmpty()) {
+                def key_variant = attributeContainer.keySet().find {
+                    it.name == "com.android.build.api.attributes.VariantAttr"
+                }
+                String variantName = null
+                if (key_variant != null) {
+                    variantName = attributeContainer.getAttribute(key_variant).getName()
+                }
+                def libVariant = targetProject.android.libraryVariants.find { variant ->
+                    variant.name == variantName
+                }
+                if (libVariant != null) {
+                    libVariant.sourceSets.each { sourceSet ->
+                        try {
+                            list.addAll(sourceSet.java.getSrcDirs())
+                        } catch (Exception e) {
+                            // ignore
+                        }
+                        try {
+                            list.addAll(sourceSet.kotlin.getSrcDirs())
+                        } catch (Exception e) {
+                            // ignore
+                        }
+                        try {
+                            list.addAll(sourceSet.jniLibs.getSrcDirs())
+                        } catch (Exception e) {
+                            // ignore
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // ignore
+            e.printStackTrace()
+        }
+    }
+    return list
+}
+
+JSONObject getProjectComponentClass(String comProjPath, def artifact) {
+    List<File> list = getFilterFileForModule(comProjPath, artifact)
+    JSONObject jsonObj = new JSONObject()
+    File comProjFile = new File(comProjPath)
+    if (comProjFile.exists()) {
+        comProjFile.listFiles().each { it ->
+            if (!it.name.equals("build")
+                    && !it.name.equals("res")
+                    && !it.name.equals("assets")) {
+                recursiveFile(it, jsonObj, "", list)
+            } else if (it.name.equals("build")) {
+                File buildSo = new File("${it.path}${File.separatorChar}intermediates${File.separator}ndkbuild")
+                if (buildSo.exists()) {
+                    // 用于搜索 module 下 使用 JNI 源码进行编译的结果
+                    recursiveFileForSo(buildSo, jsonObj)
+                }
+            }
+        }
+    }
+
+    // 根据kotlin类编译后的class处理在一个kotlin类文件中声明多个类的情况
+    File file = getModuleKotlinDestDir(comProjPath, artifact)
+    if (file != null && file.exists()) {
+        recursiveFile(file, jsonObj, "", null)
+    }
+
+    return jsonObj
+}
+
+/**
+ * 获取module compileKotlin的class文件输出目录
+ * @return
+ */
+File getModuleKotlinDestDir(String modulePath, def artifact) {
+    def targetProject = rootProject.allprojects.find {
+        it.projectDir.absolutePath == modulePath
+    }
+    if (targetProject != null) {
+        try {
+            AttributeContainer attributeContainer = artifact.variant.attributes
+            def key_variant = attributeContainer.keySet().find {
+                it.name == "com.android.build.api.attributes.VariantAttr"
+            }
+            String variantName = null
+            if (key_variant != null) {
+                variantName = attributeContainer.getAttribute(key_variant).getName()
+            }
+            if (variantName == null) {
+                return null
+            }
+            Task compileKotlin = targetProject.getTasks().findByName("compile${variantName.capitalize()}Kotlin")
+            if (compileKotlin != null && compileKotlin.destinationDir.exists()) {
+                return compileKotlin.destinationDir
+            }
+        } catch (Exception e) {
+            // ignore
+        }
+    }
+    return null
+}
+
+/**
+ * 检查file文件是否是filterList目录下的文件
+ * @param file
+ * @param fileList
+ * @return
+ */
+boolean hasFile(File file,  List<File> filterList) {
+    // 如果文件列表为空，则返回true确保与之前的逻辑保持一直
+    if (filterList == null || filterList.size() == 0) {
+        return true
+    }
+    File target = filterList.find {
+        file.absolutePath.startsWith(it.absolutePath)
+    }
+
+    if (target != null) {
+        return true
+    }
+    return false
+}
+
+def recursiveFile(File file, JSONObject jsonObj, String prefix, List<File> filterList) {
+    if (file.isDirectory() && !file.name.startsWith(".")) {
+        file.listFiles().each { ff ->
+            String adjustPrefix = prefix == "" ? file.name : prefix + "." + file.name
+            if (adjustPrefix.startsWith("src.main.java.")) {
+                adjustPrefix = adjustPrefix.substring(14, adjustPrefix.length())
+            } else if (adjustPrefix.startsWith("src.main.kotlin.")) {
+                adjustPrefix = adjustPrefix.substring(16, adjustPrefix.length())
+            } else if (adjustPrefix.startsWith("main.java.")) {
+                adjustPrefix = adjustPrefix.substring(10, adjustPrefix.length())
+            } else if (adjustPrefix.startsWith("main.kotlin.")) {
+                adjustPrefix = adjustPrefix.substring(12, adjustPrefix.length())
+            } else if (adjustPrefix.startsWith("src.")) {
+                adjustPrefix = adjustPrefix.substring(4, adjustPrefix.length())
+            } else if (!adjustPrefix.startsWith("com.") && adjustPrefix.contains(".com.")) {
+                // 直接以 com 为最开始的头部
+                int startIndex = Math.min(adjustPrefix.split("\\.com\\.")[0].length() + 1, adjustPrefix.length() - 1)
+                adjustPrefix = adjustPrefix.substring(startIndex, adjustPrefix.length())
+            }
+            recursiveFile(ff, jsonObj, adjustPrefix, filterList)
+        }
+    } else if (file.name.endsWith(".kt")) {
+        String adjustName = prefix + "." + file.name
+        adjustName = adjustName.substring(0, adjustName.length() - 3)
+        if (jsonObj.get(adjustName) != null) {
+            // 存在相同的类，此时说明存在不同的flavor，读取了不同flavor下相同的类，这种情况需要判断当前的flavor是否包含该类
+            if (hasFile(file, filterList)) {
+                jsonObj.put(adjustName, file.absolutePath.substring(rootDir.absolutePath.length()))
+            }
+        } else {
+            jsonObj.put(adjustName, file.absolutePath.substring(rootDir.absolutePath.length()))
+        }
+    } else if (file.name.endsWith(".java") && !file.name.equals("R.java")) {
+        String adjustName = prefix + "." + file.name
+        adjustName = adjustName.substring(0, adjustName.length() - 5)
+        if (jsonObj.get(adjustName) != null) {
+            // 存在相同的类，此时说明存在不同的flavor，读取了不同flavor下相同的类，这种情况需要判断当前的flavor是否包含该类
+            if (hasFile(file, filterList)) {
+                jsonObj.put(adjustName, file.absolutePath.substring(rootDir.absolutePath.length()))
+            }
+        } else {
+            jsonObj.put(adjustName, file.absolutePath.substring(rootDir.absolutePath.length()))
+        }
+    } else if (file.name.endsWith(".so")) {
+        String soValue = ''
+        if (jsonObj.containsKey("so")) {
+            soValue = jsonObj.get("so") + "#" + file.name
+        } else {
+            soValue = file.name
+        }
+        jsonObj.put("so", soValue)
+    } else if (file.name.endsWith(".class")) {
+        // 该判断条件目前只针对一个kotlin类文件中声明多个类的情况
+        if (file.absolutePath.contains("kotlin-classes")
+                && !file.name.equals("R.class")
+                && !file.name.contains('$')) {
+            String adjustName = prefix + "." + file.name
+            adjustName = adjustName.substring(0, adjustName.length() - 6)
+            // json中不包含该类，代表该类是与另外的类声明在同一kt文件中的，需要找到产生该class的kt文件
+            if (jsonObj.get(adjustName) == null) {
+
+                String kotlinFileName = null
+                try {
+                    ClassVisitor visitor = new ClassVisitor(Opcodes.ASM6) {
+                        @Override
+                        void visitSource(String source, String debug) {
+                            super.visitSource(source, debug)
+                            kotlinFileName = source
+                        }
+                    };
+
+                    FileInputStream fis = new FileInputStream(file);
+                    ClassReader classReader = new ClassReader(fis);
+                    classReader.accept(visitor, 0);
+                } catch (Exception e) {
+                    // ignore
+                }
+
+                if (kotlinFileName == null || kotlinFileName.isEmpty()) {
+                    return
+                }
+                kotlinFileName = kotlinFileName.substring(0, kotlinFileName.lastIndexOf("."))
+                String ktPath = jsonObj.get(prefix + "." + kotlinFileName)
+                if (ktPath != null) {
+                    jsonObj.put(adjustName, ktPath)
+                }
+            }
+        }
+
+    }
+}
+
+def recursiveFileForSo(File file, JSONObject jsonObj) {
+    if (file.isDirectory()) {
+        file.listFiles().each { ff ->
+            recursiveFileForSo(ff, jsonObj)
+        }
+    }
+    if (file.name.endsWith(".so")) {
+        String soValue = ''
+        if (jsonObj.containsKey("so")) {
+            soValue = jsonObj.get("so") + "#" + file.name
+        } else {
+            soValue = file.name
+        }
+        jsonObj.put("so", soValue)
+    }
+}
+
+Map<ResolvedArtifactResult, String> getDependenciesMap(def variant) {
+    def runtimeJars = null
+    ClassLoader classLoader = variant.class.getClassLoader()
+    try {
+        def variantScope = variant.variantData.scope
+        // 反射实现保证classLoader一致性，否则会报错
+        runtimeJars = variantScope.getArtifactCollection(
+                Enum.valueOf(classLoader.loadClass('com.android.build.gradle.internal.publishing.AndroidArtifacts$ConsumedConfigType'), 'RUNTIME_CLASSPATH'),
+                Enum.valueOf(classLoader.loadClass('com.android.build.gradle.internal.publishing.AndroidArtifacts$ArtifactScope'), 'ALL'),
+                Enum.valueOf(classLoader.loadClass('com.android.build.gradle.internal.publishing.AndroidArtifacts$ArtifactType'), 'CLASSES'))
+    } catch (Throwable t) {
+        runtimeJars = variant.variantData.variantDependencies.getArtifactCollection(
+                Enum.valueOf(classLoader.loadClass('com.android.build.gradle.internal.publishing.AndroidArtifacts$ConsumedConfigType'), 'RUNTIME_CLASSPATH'),
+                Enum.valueOf(classLoader.loadClass('com.android.build.gradle.internal.publishing.AndroidArtifacts$ArtifactScope'), 'ALL'),
+                Enum.valueOf(classLoader.loadClass('com.android.build.gradle.internal.publishing.AndroidArtifacts$ArtifactType'), 'CLASSES_JAR'))
+    }
+
+
+    HashMap<String, ResolvedArtifactResult> artifactMap = new HashMap<>()
+    runtimeJars.getArtifacts().each { artifact ->
+        ComponentIdentifier identifier = artifact.id.componentIdentifier
+        if (identifier != null) {
+            String className = identifier.class.simpleName
+            if (className.equals("DefaultModuleComponentIdentifier") || className.equals("MavenUniqueSnapshotComponentIdentifier")) {
+                // 只处理maven坐标依赖
+                // 增加了对于snapshot组件的处理
+                artifactMap.put(artifact, identifier.toString())
+            } else if (className.equals("DefaultProjectComponentIdentifier")) {
+                artifactMap.put(artifact, identifier.toString())
+            } else if (identifier.toString().endsWith(".jar")) {
+                artifactMap.put(artifact, identifier.toString())
+            }
+        }
+    }
+    //重要：hook jetify 获取 artifact 映射
+    if (project.hasProperty("ttbuild_jetify_hook")) {
+        return project._ttBuild_artifact_hook.convertArtifactMap(artifactMap)
+    }
+    return artifactMap
+}
+
+def uploadCrashDispatchJson(JSONObject jsonBody, String appId,
+                            String version, String commitId, String pluginPkg) {
+    if (jsonBody == null || jsonBody.isEmpty()) {
+        println "[bytebus] failed to crash dispatch json: the json is empty"
+        return
+    }
+
+    println "use optimize crash upload"
+    Gson gson = new GsonBuilder().serializeNulls().create();
+    String jsonBodyStr = gson.toJson(jsonBody)
+
+    String path = "apps/crash-dispatch/android/${appId}"
+    if (pluginPkg != null && !pluginPkg.isEmpty()) {
+        path = "${path}/${pluginPkg}"
+        busUploadFile("ttclient-android-crashinfo",
+                "NTD082DDQDJZ2TTS38KS", "$path/${version}.json",
+                jsonBodyStr, "application/json"
+        )
+    } else {
+        busUploadFile("ttclient-android-crashinfo",
+                "NTD082DDQDJZ2TTS38KS", "$path/${commitId}.json",
+                jsonBodyStr, "application/json"
+        )
+    }
+
+    println "[bytebus] finish upload crash dispatch json to $path"
+}
+
+def searchAarSo(String path, Set soSet) {
+    if (path == null || path.isEmpty() || soSet == null) {
+        return
+    }
+    File file = new File(path)
+    if (file.exists()) {
+        if (file.name.endsWith(".so")) {
+            soSet.add(file.name)
+            return
+        } else if (file.isDirectory()
+                && !file.name.equals("jars")
+                && !file.name.equals("res")) {
+            file.listFiles().each { child ->
+                searchAarSo(child.path, soSet)
+            }
+            return
+        }
+    }
+}
+
+def getAndroidPluginVersion(def variant) {
+    String version = "0.0.0"
+    try {
+        ClassLoader classLoader = variant.getClass().getClassLoader()
+        Class clazz = classLoader.loadClass("com.android.builder.model.Version")
+        version = (String) clazz.getDeclaredField('ANDROID_GRADLE_PLUGIN_VERSION').get(null)
+    } catch (Exception e) {
+        println "[bytebus] can not get gradle plugin version"
+    }
+    return version
+}
