@@ -8,14 +8,9 @@ import org.json.simple.JSONObject
 import org.objectweb.asm.ClassReader
 import org.objectweb.asm.ClassVisitor
 import org.objectweb.asm.Opcodes
+import sun.net.www.protocol.https.HttpsURLConnectionImpl
 
 import javax.net.ssl.HostnameVerifier
-import javax.net.ssl.X509TrustManager
-import javax.net.ssl.SSLContext
-import java.security.cert.X509Certificate
-import javax.net.ssl.TrustManager
-import java.security.SecureRandom
-import org.apache.http.conn.ssl.SSLSocketFactory
 import org.apache.http.impl.client.DefaultHttpClient
 import org.apache.http.impl.conn.SingleClientConnManager
 import org.apache.http.client.methods.HttpPost
@@ -23,10 +18,12 @@ import org.apache.http.conn.scheme.Scheme
 import org.apache.http.conn.scheme.SchemeRegistry
 import java.util.regex.Matcher
 import java.util.regex.Pattern
+import java.util.stream.Collectors
 import java.util.zip.ZipFile
 import org.apache.http.conn.ssl.*
 import org.apache.http.HttpResponse
 import org.apache.http.entity.StringEntity
+import org.apache.http.conn.ssl.SSLSocketFactory
 
 import static groovyx.net.http.Method.POST
 
@@ -75,16 +72,13 @@ buildscript {
 apply from: "https://mars-devops.tos-cn-beijing.volces.com/component-statistic/depend.gradle"
 
 boolean hasGrayPublish() {
-//    String workflowTypes = System.getenv("WORKFLOW_TASK_TYPES")
-//    if (null != workflowTypes && workflowTypes.contains("gray_publish")) {
-//        println("[bytebus]: has gray publish service in this workflow")
-//        println("[bytebus-signal]:v1.0.0")
-//        return true
-//    }
-//    println("[bytebus]: gray publish service NOT FOUND")
-//    println("[bytebus-signal]:v1.0.1")
-//    return false
-    return true
+    String workflowTypes = System.getenv("WORKFLOW_TASK_TYPES")
+    if (null != workflowTypes && workflowTypes.contains("gray_publish")) {
+        println("[bytebus]: has gray publish service in this workflow")
+        return true
+    }
+    println("[bytebus]: gray publish service NOT FOUND")
+    return false
 }
 
 // versionTag apk 版本号TAG：不填：使用apk原生versionCode值，
@@ -820,7 +814,7 @@ def uploadDepsInfoToVeMARS(JSONObject jsonBody) {
     println "[bytebus] report url: $url"
 
     // Do not do this in production!!!
-    HostnameVerifier hostnameVerifier = org.apache.http.conn.ssl.SSLSocketFactory.ALLOW_ALL_HOSTNAME_VERIFIER;
+    HostnameVerifier hostnameVerifier = SSLSocketFactory.ALLOW_ALL_HOSTNAME_VERIFIER;
 
     DefaultHttpClient client = new DefaultHttpClient();
 
@@ -832,60 +826,33 @@ def uploadDepsInfoToVeMARS(JSONObject jsonBody) {
     DefaultHttpClient httpClient = new DefaultHttpClient(mgr, client.getParams());
 
     // Set verifier
-    sun.net.www.protocol.https.HttpsURLConnectionImpl.setDefaultHostnameVerifier(hostnameVerifier);
+    HttpsURLConnectionImpl.setDefaultHostnameVerifier(hostnameVerifier);
 
     // Example send http request
     HttpPost httpPost = new HttpPost(url);
     println jsonBody
     StringEntity params = new StringEntity(jsonBody.toString())
     httpPost.addHeader("content-type", "application/json");
-    httpPost.setEntity(params);
-    HttpResponse response = httpClient.execute(httpPost);
+    httpPost.setEntity(params)
+    InputStream inputStream = null
+    try {
+        HttpResponse response = httpClient.execute(httpPost);
+        inputStream = response.getEntity().getContent()
+        String result = new BufferedReader(new InputStreamReader(inputStream))
+                .lines().collect(Collectors.joining("\n"));
+        println "[bytebus]:res: " + result
+    } catch (Exception e) {
+        println "[bytebus]: 在网络请求过程中抛出了异常: " + e.getMessage()
+    } finally {
+        if (inputStream != null) {
+            try {
+                inputStream.close()
+            } catch (IOException e) {
+                println "[bytebus]: inputStream 流关闭异常: " + e.getMessage()
+            }
+        }
 
-    InputStream inputStream = response.getEntity().getContent()
-    String result = new BufferedReader(new InputStreamReader(inputStream))
-            .lines().collect(java.util.stream.Collectors.joining("\n"));
-    println "[bytebus]:res: " + result
-
-
-
-
-//    def http = new HTTPBuilder(url)
-//    def sslContext = SSLContext.getInstance("SSL")
-//    sslContext.init(null, [ new X509TrustManager() {
-//        public X509Certificate[] getAcceptedIssuers() {null }
-//        public void checkClientTrusted(X509Certificate[] certs, String authType) { }
-//        public void checkServerTrusted(X509Certificate[] certs, String authType) { }
-//    } ] as TrustManager[], new SecureRandom())
-//    def sf = new SSLSocketFactory(sslContext)
-//    def httpsScheme = new Scheme("https", sf, 443)
-//    http.client.connectionManager.schemeRegistry.register( httpsScheme )
-//    println "[bytebus] start uploadDepsInfo----------------------->>>>>>>>"
-//
-//    http.request(POST, ContentType.JSON) { req ->
-//        body = jsonBody
-//
-//        println jsonBody
-//
-//        response.success = { resp, json ->
-//            if (resp.status == 200) {
-//                println "[bytebus] responese sataus: " + resp.status
-//                println "[bytebus] responese issuccess: " + resp.isSuccess()
-//                if (json['code'] == 0) {
-//                    println "[bytebus] ${json}"
-//                    println "[bytebus] success to upload dependency. resp: $resp"
-//                } else {
-//                    println "[bytebus] failed to upload, responese: " + resp
-//                }
-//            } else {
-//                println "[bytebus] failed to upload dependency, status: ${resp.status}"
-//            }
-//        }
-//
-//        response.failure = { resp ->
-//            println "[bytebus] failed to upload dependency: ${resp.status}"
-//        }
-//    }
+    }
 }
 
 /**

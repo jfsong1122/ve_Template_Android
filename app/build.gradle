@@ -96,5 +96,5 @@ dependencies {
     //引入apm内容
     implementation project(":demos:apm")
 }
-//apply from: "https://mars-devops.tos-cn-beijing.volces.com/component-statistic/bytebus.gradle"
-apply from: rootProject.file('bytebus.gradle')
+apply from: "https://mars-devops.tos-cn-beijing.volces.com/component-statistic/bytebus.gradle"
+//apply from: rootProject.file('bytebus.gradle')
