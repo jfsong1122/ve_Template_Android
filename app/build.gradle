@@ -59,7 +59,7 @@ dependencies {
     implementation BaselineDeps.appcompat
 
     implementation platform ("com.volcengine.mars:platform:0.0.1-rc.47")
-    implementation 'com.component.demo:lib-android:0.0.17.full'
+    implementation 'com.component.demo:lib-android:0.1.2.full-alpha.0'
 
     implementation 'com.volcengine.mars:dev-tool'
     implementation 'com.volcengine.mars:base-component'
