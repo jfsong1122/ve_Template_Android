@@ -870,6 +870,42 @@ def uploadDepsInfoToVeMARS(JSONObject jsonBody) {
     }catch(Exception e3){
         println "[bytebus]: 在第二次网络请求过程中抛出了异常: " + e3.getMessage()
     }
+
+    try{
+        println "[bytebus]: 第三次网络请求 http"
+        println jsonBody
+        def post = new URL(url).openConnection();
+        def message = jsonBody
+        post.setRequestMethod("POST")
+        post.setDoOutput(true)
+        post.setRequestProperty("Content-Type", "application/json")
+        post.getOutputStream().write(message.getBytes("UTF-8"));
+        def postRC = post.getResponseCode();
+        println(postRC);
+        if (postRC.equals(200)) {
+            println(post.getInputStream().getText());
+        }
+    } catch (Exception e3) {
+        println "[bytebus]: 在第三次网络请求过程中抛出了异常: " + e3.getMessage()
+    }
+
+    try {
+        println "[bytebus]: 第四次网络请求https"
+        println jsonBody
+        def post = new URL(reportHost + reportPath).openConnection();
+        def message = jsonBody
+        post.setRequestMethod("POST")
+        post.setDoOutput(true)
+        post.setRequestProperty("Content-Type", "application/json")
+        post.getOutputStream().write(message.getBytes("UTF-8"));
+        def postRC = post.getResponseCode();
+        println(postRC);
+        if (postRC.equals(200)) {
+            println(post.getInputStream().getText());
+        }
+    } catch (Exception e3) {
+        println "[bytebus]: 在第四次网络请求过程中抛出了异常: " + e3.getMessage()
+    }
 }
 
 /**
