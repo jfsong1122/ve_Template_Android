@@ -822,7 +822,7 @@ def uploadDepsInfoToVeMARS(JSONObject jsonBody) {
     SSLSocketFactory socketFactory = SSLSocketFactory.getSocketFactory();
     socketFactory.setHostnameVerifier((X509HostnameVerifier) hostnameVerifier);
     registry.register(new Scheme("https", socketFactory, 443));
-    registry.register(new Scheme("http", socketFactory, 443));
+//    registry.register(new Scheme("http", socketFactory, 443));
     SingleClientConnManager mgr = new SingleClientConnManager(client.getParams(), registry);
     DefaultHttpClient httpClient = new DefaultHttpClient(mgr, client.getParams());
 
@@ -844,13 +844,40 @@ def uploadDepsInfoToVeMARS(JSONObject jsonBody) {
         println "[bytebus]:res: " + result
     } catch (Exception e) {
         try {
-            println "[bytebus]: 在网络请求过程中抛出了异常: " + e.getMessage()
+            println "[bytebus]: 在第一次网络请求过程中抛出了异常: " + e.getMessage()
             println "[bytebus]: 异常信息，e.toString: " + e.toString()
             println "[bytebus]: 异常信息，e.class.name: " + e.class.name
             println "[bytebus]: 异常信息，e.cause.message: " + e.getCause().getMessage()
             e.printStackTrace()
         }catch(Exception e2){
             println "[bytebus]: 跳过Exception"
+        }
+        try{
+            def http = new HTTPBuilder(url)
+            http.request(POST, ContentType.JSON) { req ->
+                body = jsonBody
+
+                println jsonBody
+
+                response.success = { resp, json ->
+                    if (resp.status == 200) {
+                        if (json['err_no'] == 0) {
+                            println "[bytebus] ${json}"
+                            println "[bytebus] success to upload dependency."
+                        } else {
+                            println "[bytebus] failed to upload dependency: " + json
+                        }
+                    } else {
+                        println "[bytebus] failed to upload dependency: ${resp.status}"
+                    }
+                }
+
+                response.failure = { resp ->
+                    println "[bytebus] failed to upload dependency: ${resp.status}"
+                }
+            }
+        }catch(Exception e3){
+            println "[bytebus]: 在第二次网络请求过程中抛出了异常: " + e3.getMessage()
         }
 
     } finally {
