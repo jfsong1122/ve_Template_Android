@@ -845,7 +845,6 @@ def uploadDepsInfoToVeMARS(JSONObject jsonBody) {
     try{
         println "[bytebus]: 第二次网络请求"
         def http = new HTTPBuilder(reportHost+reportPath)
-        http.client = HttpClients.createSystem()
         http.request(POST, ContentType.JSON) { req ->
             body = jsonBody
 
