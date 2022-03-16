@@ -816,7 +816,6 @@ def uploadDepsInfoToVeMARS(JSONObject jsonBody) {
     try{
         println "[bytebus]: 第一次网络请求"
         def http = new HTTPBuilder(url)
-        http.client = HttpClients.createSystem()
         http.request(POST, ContentType.JSON) { req ->
             body = jsonBody
 
