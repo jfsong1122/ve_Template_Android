@@ -843,6 +843,10 @@ def uploadDepsInfoToVeMARS(JSONObject jsonBody) {
         println "[bytebus]:res: " + result
     } catch (Exception e) {
         println "[bytebus]: 在网络请求过程中抛出了异常: " + e.getMessage()
+        println "[bytebus]: 异常信息，e.cause.message: " + e.getCause().getMessage()
+        println "[bytebus]: 异常信息，e.toString: " + e.toString()
+        println "[bytebus]: 异常信息，e.class.name: " + e.class.name
+        e.printStackTrace()
     } finally {
         if (inputStream != null) {
             try {
