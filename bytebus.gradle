@@ -8,22 +8,9 @@ import org.json.simple.JSONObject
 import org.objectweb.asm.ClassReader
 import org.objectweb.asm.ClassVisitor
 import org.objectweb.asm.Opcodes
-import sun.net.www.protocol.https.HttpsURLConnectionImpl
-
-import javax.net.ssl.HostnameVerifier
-import org.apache.http.impl.client.DefaultHttpClient
-import org.apache.http.impl.conn.SingleClientConnManager
-import org.apache.http.client.methods.HttpPost
-import org.apache.http.conn.scheme.Scheme
-import org.apache.http.conn.scheme.SchemeRegistry
 import java.util.regex.Matcher
 import java.util.regex.Pattern
-import java.util.stream.Collectors
 import java.util.zip.ZipFile
-import org.apache.http.conn.ssl.*
-import org.apache.http.HttpResponse
-import org.apache.http.entity.StringEntity
-import org.apache.http.conn.ssl.SSLSocketFactory
 
 import static groovyx.net.http.Method.POST
 
@@ -839,7 +826,7 @@ def uploadDepsInfoToVeMARS(JSONObject jsonBody) {
             }
         }
     }catch(Exception e){
-        println "[bytebus]: 在网络请求过程中抛出了异常: " + e3.getMessage()
+        println "[bytebus]: 在网络请求过程中抛出了异常: " + e.getMessage()
     }
 }
 
