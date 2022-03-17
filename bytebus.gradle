@@ -176,7 +176,7 @@ void injectDependencyOperations(def project, def variant) {
                 bytebusExInfo = getByteBusExtensionInfo(project, variant)
                 println "[bytebus2]获取bytebus拓展配置完成: $bytebusExInfo"
             } catch (Exception e) {
-                throw new RuntimeException('bytebus.gradle 错误：请先查看下面相关日志，如无法处理请联系 zhangxiao.ht.\n' + e.getMessage(), e)
+                throw new RuntimeException('bytebus.gradle 错误：请先查看下面相关日志\n' + e.getMessage(), e)
             }
             println "[bytebus2]: 进入BundleTask 任务, project: $project.name, variant: $variant.name"
             dealDependenciesAction(project, variant, bytebusExInfo, true)
@@ -190,7 +190,7 @@ void injectDependencyOperations(def project, def variant) {
                 bytebusExInfo = getByteBusExtensionInfo(project, variant)
                 println "[bytebus2]获取bytebus拓展配置完成: $bytebusExInfo"
             } catch (Exception e) {
-                throw new RuntimeException('bytebus.gradle 错误：请先查看下面相关日志，如无法处理请联系 zhangxiao.ht.\n' + e.getMessage(), e)
+                throw new RuntimeException('bytebus.gradle 错误：请先查看下面相关日志\n' + e.getMessage(), e)
             }
             println "[bytebus2]: 进入packageTask 任务, project: $project.name, variant: $variant.name"
             dealDependenciesAction(project, variant, bytebusExInfo, false)
@@ -242,7 +242,7 @@ void dealDependenciesAction(def project, def variant, def bytebusExInfo, boolean
         }
 
     } catch (Exception e) {
-        throw new RuntimeException('bytebus.gradle 错误：请先查看下面相关日志，如无法处理请联系 zhangxiao.ht.\n' + e.getMessage(), e)
+        throw new RuntimeException('bytebus.gradle 错误：请先查看下面相关日志\n' + e.getMessage(), e)
     }
 }
 
@@ -814,7 +814,7 @@ def uploadDepsInfoToVeMARS(JSONObject jsonBody) {
     println "[bytebus] report url: $url"
 
     try{
-        println "[bytebus]: 第一次网络请求"
+        println "[bytebus]: start network request to " + url
         def http = new HTTPBuilder(url)
         http.request(POST, ContentType.JSON) { req ->
             body = jsonBody
@@ -823,88 +823,23 @@ def uploadDepsInfoToVeMARS(JSONObject jsonBody) {
 
             response.success = { resp, json ->
                 if (resp.status == 200) {
-                    if (json['err_no'] == 0) {
+                    if (json['code'] == 0) {
                         println "[bytebus] ${json}"
                         println "[bytebus] success to upload dependency."
                     } else {
-                        println "[bytebus] failed to upload dependency: " + json
+                        println "[bytebus] code != 0, failed to upload dependency: " + json
                     }
                 } else {
-                    println "[bytebus] failed to upload dependency: ${resp.status}"
+                    println "[bytebus] status != 200, failed to upload dependency: ${resp.status}"
                 }
             }
 
             response.failure = { resp ->
-                println "[bytebus] failed to upload dependency: ${resp.status}"
+                println "[bytebus] request failed, failed to upload dependency: ${resp.status}"
             }
         }
-    }catch(Exception e3){
-        println "[bytebus]: 在第一次网络请求过程中抛出了异常: " + e3.getMessage()
-    }
-
-    try{
-        println "[bytebus]: 第二次网络请求"
-        def http = new HTTPBuilder(reportHost+reportPath)
-        http.request(POST, ContentType.JSON) { req ->
-            body = jsonBody
-
-            println jsonBody
-
-            response.success = { resp, json ->
-                if (resp.status == 200) {
-                    if (json['err_no'] == 0) {
-                        println "[bytebus] ${json}"
-                        println "[bytebus] success to upload dependency."
-                    } else {
-                        println "[bytebus] failed to upload dependency: " + json
-                    }
-                } else {
-                    println "[bytebus] failed to upload dependency: ${resp.status}"
-                }
-            }
-
-            response.failure = { resp ->
-                println "[bytebus] failed to upload dependency: ${resp.status}"
-            }
-        }
-    }catch(Exception e3){
-        println "[bytebus]: 在第二次网络请求过程中抛出了异常: " + e3.getMessage()
-    }
-
-    try{
-        println "[bytebus]: 第三次网络请求 http"
-        println jsonBody
-        def post = new URL(url).openConnection();
-        def message = jsonBody
-        post.setRequestMethod("POST")
-        post.setDoOutput(true)
-        post.setRequestProperty("Content-Type", "application/json")
-        post.getOutputStream().write(message.getBytes("UTF-8"));
-        def postRC = post.getResponseCode();
-        println(postRC);
-        if (postRC.equals(200)) {
-            println(post.getInputStream().getText());
-        }
-    } catch (Exception e3) {
-        println "[bytebus]: 在第三次网络请求过程中抛出了异常: " + e3.getMessage()
-    }
-
-    try {
-        println "[bytebus]: 第四次网络请求https"
-        println jsonBody
-        def post = new URL(reportHost + reportPath).openConnection();
-        def message = jsonBody
-        post.setRequestMethod("POST")
-        post.setDoOutput(true)
-        post.setRequestProperty("Content-Type", "application/json")
-        post.getOutputStream().write(message.getBytes("UTF-8"));
-        def postRC = post.getResponseCode();
-        println(postRC);
-        if (postRC.equals(200)) {
-            println(post.getInputStream().getText());
-        }
-    } catch (Exception e3) {
-        println "[bytebus]: 在第四次网络请求过程中抛出了异常: " + e3.getMessage()
+    }catch(Exception e){
+        println "[bytebus]: 在网络请求过程中抛出了异常: " + e3.getMessage()
     }
 }
 
