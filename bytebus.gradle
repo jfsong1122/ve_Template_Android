@@ -8,9 +8,22 @@ import org.json.simple.JSONObject
 import org.objectweb.asm.ClassReader
 import org.objectweb.asm.ClassVisitor
 import org.objectweb.asm.Opcodes
+import sun.net.www.protocol.https.HttpsURLConnectionImpl
+
+import javax.net.ssl.HostnameVerifier
+import org.apache.http.impl.client.DefaultHttpClient
+import org.apache.http.impl.conn.SingleClientConnManager
+import org.apache.http.client.methods.HttpPost
+import org.apache.http.conn.scheme.Scheme
+import org.apache.http.conn.scheme.SchemeRegistry
 import java.util.regex.Matcher
 import java.util.regex.Pattern
+import java.util.stream.Collectors
 import java.util.zip.ZipFile
+import org.apache.http.conn.ssl.*
+import org.apache.http.HttpResponse
+import org.apache.http.entity.StringEntity
+import org.apache.http.conn.ssl.SSLSocketFactory
 
 import static groovyx.net.http.Method.POST
 
@@ -163,7 +176,7 @@ void injectDependencyOperations(def project, def variant) {
                 bytebusExInfo = getByteBusExtensionInfo(project, variant)
                 println "[bytebus2]获取bytebus拓展配置完成: $bytebusExInfo"
             } catch (Exception e) {
-                throw new RuntimeException('bytebus.gradle 错误：请先查看下面相关日志\n' + e.getMessage(), e)
+                throw new RuntimeException('bytebus.gradle 错误：请先查看下面相关日志，如无法处理请联系 zhangxiao.ht.\n' + e.getMessage(), e)
             }
             println "[bytebus2]: 进入BundleTask 任务, project: $project.name, variant: $variant.name"
             dealDependenciesAction(project, variant, bytebusExInfo, true)
@@ -177,7 +190,7 @@ void injectDependencyOperations(def project, def variant) {
                 bytebusExInfo = getByteBusExtensionInfo(project, variant)
                 println "[bytebus2]获取bytebus拓展配置完成: $bytebusExInfo"
             } catch (Exception e) {
-                throw new RuntimeException('bytebus.gradle 错误：请先查看下面相关日志\n' + e.getMessage(), e)
+                throw new RuntimeException('bytebus.gradle 错误：请先查看下面相关日志，如无法处理请联系 zhangxiao.ht.\n' + e.getMessage(), e)
             }
             println "[bytebus2]: 进入packageTask 任务, project: $project.name, variant: $variant.name"
             dealDependenciesAction(project, variant, bytebusExInfo, false)
@@ -229,7 +242,7 @@ void dealDependenciesAction(def project, def variant, def bytebusExInfo, boolean
         }
 
     } catch (Exception e) {
-        throw new RuntimeException('bytebus.gradle 错误：请先查看下面相关日志\n' + e.getMessage(), e)
+        throw new RuntimeException('bytebus.gradle 错误：请先查看下面相关日志，如无法处理请联系 zhangxiao.ht.\n' + e.getMessage(), e)
     }
 }
 
@@ -800,33 +813,45 @@ def uploadDepsInfoToVeMARS(JSONObject jsonBody) {
     String url = reportHost + reportPath
     println "[bytebus] report url: $url"
 
-    try{
-        println "[bytebus]: start network request to " + url
-        def http = new HTTPBuilder(url)
-        http.request(POST, ContentType.JSON) { req ->
-            body = jsonBody
+    // Do not do this in production!!!
+    HostnameVerifier hostnameVerifier = SSLSocketFactory.ALLOW_ALL_HOSTNAME_VERIFIER;
 
-            println jsonBody
+    DefaultHttpClient client = new DefaultHttpClient();
 
-            response.success = { resp, json ->
-                if (resp.status == 200) {
-                    if (json['code'] == 0) {
-                        println "[bytebus] ${json}"
-                        println "[bytebus] success to upload dependency."
-                    } else {
-                        println "[bytebus] code != 0, failed to upload dependency: " + json
-                    }
-                } else {
-                    println "[bytebus] status != 200, failed to upload dependency: ${resp.status}"
-                }
-            }
+    SchemeRegistry registry = new SchemeRegistry();
+    SSLSocketFactory socketFactory = SSLSocketFactory.getSocketFactory();
+    socketFactory.setHostnameVerifier((X509HostnameVerifier) hostnameVerifier);
+    registry.register(new Scheme("https", socketFactory, 443));
+    SingleClientConnManager mgr = new SingleClientConnManager(client.getParams(), registry);
+    DefaultHttpClient httpClient = new DefaultHttpClient(mgr, client.getParams());
 
-            response.failure = { resp ->
-                println "[bytebus] request failed, failed to upload dependency: ${resp.status}"
+    // Set verifier
+    HttpsURLConnectionImpl.setDefaultHostnameVerifier(hostnameVerifier);
+
+    // Example send http request
+    HttpPost httpPost = new HttpPost(url);
+    println jsonBody
+    StringEntity params = new StringEntity(jsonBody.toString())
+    httpPost.addHeader("content-type", "application/json");
+    httpPost.setEntity(params)
+    InputStream inputStream = null
+    try {
+        HttpResponse response = httpClient.execute(httpPost);
+        inputStream = response.getEntity().getContent()
+        String result = new BufferedReader(new InputStreamReader(inputStream))
+                .lines().collect(Collectors.joining("\n"));
+        println "[bytebus]:res: " + result
+    } catch (Exception e) {
+        println "[bytebus]: 在网络请求过程中抛出了异常: " + e.getMessage()
+    } finally {
+        if (inputStream != null) {
+            try {
+                inputStream.close()
+            } catch (IOException e) {
+                println "[bytebus]: inputStream 流关闭异常: " + e.getMessage()
             }
         }
-    }catch(Exception e){
-        println "[bytebus]: 在网络请求过程中抛出了异常: " + e.getMessage()
+
     }
 }
 
@@ -1472,7 +1497,7 @@ Map<ResolvedArtifactResult, String> getDependenciesMap(def variant) {
 }
 
 def uploadCrashDispatchJson(JSONObject jsonBody, String appId,
-                            String version, String commitId, String pluginPkg) {
+        String version, String commitId, String pluginPkg) {
     if (jsonBody == null || jsonBody.isEmpty()) {
         println "[bytebus] failed to crash dispatch json: the json is empty"
         return
